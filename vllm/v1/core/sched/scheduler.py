@@ -170,7 +170,10 @@ class Scheduler(SchedulerInterface):
             if self.log_stats:
                 self.connector_prefix_cache_stats = PrefixCacheStats()
             kv_load_failure_policy = kv_transfer_config.kv_load_failure_policy
-            self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+            self.recompute_kv_load_failures = (
+                kv_load_failure_policy == "recompute"
+                or __import__("os").environ.get("ROLE") == "prefill"
+            )
 
             # With overlapping batches (async scheduling or PP), a step may
             # still be writing a freed request's KV blocks. A consumer KV
@@ -884,13 +887,28 @@ class Scheduler(SchedulerInterface):
 
             while token_budget > 0:
                 # Requests holding KV blocks are always drained first.
+                if (
+                    not self.kv_holding_waiting
+                    and self.waiting
+                    and self.scheduler_config.long_prefill_token_threshold > 0
+                ):
+                    self._promote_warmest_waiting()
                 request_queue = self.kv_holding_waiting or self.waiting
                 if not request_queue or input_budget <= draft_slots:
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
-                num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_active_reqs:
+                num_running = (
+                    len(self.running)
+                    + self.num_waiting_for_streaming_input
+                    + len(step_skipped_waiting)
+                )
+                _eff_max_reqs = (
+                    2
+                    if self.scheduler_config.long_prefill_token_threshold > 0
+                    else self.max_num_active_reqs
+                )
+                if num_running >= _eff_max_reqs:
                     break
 
                 request = request_queue.peek_request()
@@ -2545,6 +2563,50 @@ class Scheduler(SchedulerInterface):
             sched_spec_tokens[req_id] = spec_token_ids
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+
+    def _paw_cold_tokens(self, request: Request) -> int:
+        kvm = self.kv_cache_manager
+        if not kvm.enable_caching or request.skip_reading_prefix_cache:
+            return request.num_tokens
+        if request.num_computed_tokens > 0:
+            return max(0, request.num_tokens - request.num_computed_tokens)
+        try:
+            res = kvm.coordinator.find_longest_cache_hit(
+                request.block_hashes, max(request.num_tokens - 1, 0)
+            )
+            local_hit = int(res[1])
+            return max(0, request.num_tokens - local_hit)
+        except Exception:
+            return request.num_tokens
+
+    def _promote_warmest_waiting(self) -> int | None:
+        if self.policy != SchedulingPolicy.FCFS or not self.waiting:
+            return None
+        if len(self.waiting) == 1:
+            return self._paw_cold_tokens(self.waiting.peek_request())
+        from itertools import islice
+
+        window = list(islice(self.waiting, 64))
+        head = window[0]
+        best_req = head
+        best_key = (
+            0 if head.num_preemptions > 0 else 1,
+            self._paw_cold_tokens(head),
+            head.arrival_time,
+        )
+        for r in window[1:]:
+            k = (
+                0 if r.num_preemptions > 0 else 1,
+                self._paw_cold_tokens(r),
+                r.arrival_time,
+            )
+            if k < best_key:
+                best_key = k
+                best_req = r
+        if best_req is not head:
+            self.waiting.remove(best_req)
+            self.waiting.prepend_request(best_req)
+        return best_key[1]
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
