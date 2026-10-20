@@ -156,7 +156,10 @@ class Scheduler(SchedulerInterface):
             if self.log_stats:
                 self.connector_prefix_cache_stats = PrefixCacheStats()
             kv_load_failure_policy = kv_transfer_config.kv_load_failure_policy
-            self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+            self.recompute_kv_load_failures = (
+                kv_load_failure_policy == "recompute"
+                or __import__("os").environ.get("ROLE") == "prefill"
+            )
 
             # With overlapping batches (async scheduling or PP), a step may
             # still be writing a freed request's KV blocks. A consumer KV
@@ -289,7 +292,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.use_eagle and not (speculative_config is not None and (speculative_config.use_dspark() or speculative_config.use_dflash())),
             num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
@@ -548,6 +551,27 @@ class Scheduler(SchedulerInterface):
         ) and any(not r.is_prefill_chunk for r in self.running)
 
         # First, schedule the RUNNING requests.
+        self._paw_step_cnt = getattr(self, "_paw_step_cnt", 0) + 1
+        _lp_thresh = self.scheduler_config.long_prefill_token_threshold
+        _warm_wait_reserve = 0
+        if _lp_thresh > 0:
+            if self.skipped_waiting:
+                for _sr in self.skipped_waiting:
+                    if _sr.request_id in self.finished_recving_kv_req_ids:
+                        _sr_rem = max(1, _sr.num_tokens - _sr.num_computed_tokens)
+                        _warm_wait_reserve = min(_lp_thresh, _sr_rem)
+                        break
+            elif self.waiting:
+                _best_cold = self._promote_warmest_waiting()
+                if (
+                    len(self.running) == 1
+                    and _best_cold is not None
+                    and _best_cold <= 32768
+                ):
+                    _free_blks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                    if _free_blks >= (_best_cold // self.block_size) + 4:
+                        _warm_wait_reserve = min(_lp_thresh, max(1, _best_cold))
+
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -587,8 +611,27 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if 0 < _lp_thresh < num_new_tokens:
+                if req_index + 1 < len(self.running):
+                    _other_rem = sum(
+                        max(
+                            0,
+                            r.num_tokens_with_spec
+                            + r.num_output_placeholders
+                            - r.num_computed_tokens,
+                        )
+                        for r in self.running[req_index + 1 :]
+                    )
+                    if _other_rem > 0:
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            max(_lp_thresh, token_budget - min(_lp_thresh, _other_rem)),
+                        )
+                elif _warm_wait_reserve > 0 and num_new_tokens > _lp_thresh * 4:
+                    num_new_tokens = min(
+                        num_new_tokens,
+                        max(_lp_thresh, token_budget - _warm_wait_reserve),
+                    )
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -780,8 +823,13 @@ class Scheduler(SchedulerInterface):
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
-                num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_running_reqs:
+                num_running = (
+                    len(self.running)
+                    + self.num_waiting_for_streaming_input
+                    + len(step_skipped_waiting)
+                )
+                _eff_max_reqs = 2 if _lp_thresh > 0 else self.max_num_running_reqs
+                if num_running >= _eff_max_reqs:
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -982,8 +1030,8 @@ class Scheduler(SchedulerInterface):
                             pad_spec_decode = True
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    if 0 < threshold < num_new_tokens and scheduled_running_reqs:
+                        num_new_tokens = min(num_new_tokens, token_budget)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -2237,9 +2285,113 @@ class Scheduler(SchedulerInterface):
         else:
             self.waiting.add_request(request)
 
+    def _paw_cold_tokens(self, request: Request) -> int:
+        kvm = self.kv_cache_manager
+        if not kvm.enable_caching or request.skip_reading_prefix_cache:
+            return request.num_tokens
+        if request.num_computed_tokens > 0:
+            return max(0, request.num_tokens - request.num_computed_tokens)
+        try:
+            res = kvm.coordinator.find_longest_cache_hit(
+                request.block_hashes, max(request.num_tokens - 1, 0)
+            )
+            local_hit = int(res[1])
+            ext_hit = 0
+            if request.num_tokens - local_hit >= 1024 and self.connector is not None:
+                _step = getattr(self, "_paw_step_cnt", 0)
+                if (
+                    getattr(request, "_paw_ext_local", -1) == local_hit
+                    and _step - getattr(request, "_paw_ext_step", -999) < 32
+                ):
+                    ext_hit = getattr(request, "_paw_ext_hit", 0)
+                else:
+                    try:
+                        from itertools import islice
+                        from vllm.v1.kv_offload.base import make_offload_key
+
+                        conns = getattr(self.connector, "_connectors", None) or [self.connector]
+                        for c in conns:
+                            cs = getattr(c, "connector_scheduler", None)
+                            mgr = getattr(cs, "manager", None)
+                            if mgr is not None and hasattr(mgr, "_probe") and hasattr(mgr, "_expand_keys"):
+                                gcfg = cs.config.kv_group_configs[0]
+                                hpc = gcfg.hashes_per_chunk
+                                start_idx = local_hit // gcfg.tokens_per_chunk
+                                end_idx = max(request.num_tokens - 1, 0) // gcfg.tokens_per_chunk
+                                if end_idx > start_idx:
+                                    keys = [
+                                        make_offload_key(bh, gcfg.group_idx)
+                                        for bh in islice(
+                                            request.block_hashes,
+                                            start_idx * hpc + hpc - 1,
+                                            end_idx * hpc,
+                                            hpc,
+                                        )
+                                    ]
+                                    if keys and request.request_id not in getattr(mgr, "_failed_load_req_ids", ()):
+                                        probed = mgr._probe(
+                                            mgr._expand_keys(keys),
+                                            enable_global=getattr(mgr, "_enable_global", False),
+                                        )
+                                        dead = getattr(mgr, "_dead_sub_hashes", ())
+                                        if dead and probed:
+                                            valid_len = 0
+                                            for sh, _ in probed:
+                                                if sh in dead:
+                                                    break
+                                                valid_len += 1
+                                        else:
+                                            valid_len = len(probed) if probed else 0
+                                        f = getattr(mgr, "_device_block_size_factor", 1)
+                                        if valid_len > 0 and f > 0:
+                                            ext_hit = (valid_len // f) * gcfg.tokens_per_chunk
+                                break
+                    except Exception:
+                        pass
+                    request._paw_ext_local = local_hit
+                    request._paw_ext_step = _step
+                    request._paw_ext_hit = ext_hit
+            return max(0, request.num_tokens - (local_hit + ext_hit))
+        except Exception:
+            return request.num_tokens
+
+    def _promote_warmest_waiting(self) -> int | None:
+        if self.policy != SchedulingPolicy.FCFS or not self.waiting:
+            return None
+        if len(self.waiting) == 1:
+            return self._paw_cold_tokens(self.waiting.peek_request())
+        from itertools import islice
+        window = list(islice(self.waiting, 64))
+        head = window[0]
+        best_req = head
+        best_key = (
+            0 if head.num_preemptions > 0 else 1,
+            self._paw_cold_tokens(head),
+            head.arrival_time,
+        )
+        for r in window[1:]:
+            k = (
+                0 if r.num_preemptions > 0 else 1,
+                self._paw_cold_tokens(r),
+                r.arrival_time,
+            )
+            if k < best_key:
+                best_key = k
+                best_req = r
+        if best_req is not head:
+            self.waiting.remove(best_req)
+            self.waiting.prepend_request(best_req)
+        return best_key[1]
+
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
-            return self.skipped_waiting or self.waiting or None
+            if self.skipped_waiting:
+                return self.skipped_waiting
+            if self.waiting:
+                if self.scheduler_config.long_prefill_token_threshold > 0:
+                    self._promote_warmest_waiting()
+                return self.waiting
+            return None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.
         if self.waiting and self.skipped_waiting:
