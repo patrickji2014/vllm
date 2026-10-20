@@ -1885,3 +1885,195 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             "[Elastic EP] Scale down completed, new data parallel size: %s",
             new_data_parallel_size,
         )
+
+def _install_prefix_aware_routing():
+    import os, time, array, zlib
+    from collections import OrderedDict
+    if os.environ.get("ROLE") != "prefill" or os.environ.get("ENABLE_PREFIX_ROUTING", "1") not in ("1", "true", "True"):
+        return
+
+    from vllm.v1.engine.core_client import DPLBAsyncMPClient
+    orig_get = DPLBAsyncMPClient.get_core_engine_for_request
+
+    _block_map = {}
+    _engine_hashes = {}
+    _route_counts = {}
+    _session_map = {}
+    _engine_last_active = {}
+    _BLOCK_SIZE = 512
+    _MIN_MATCH_BLOCKS = 12
+    _DEEP_MATCH_BLOCKS = 32
+    _MAX_OWNERS = 3
+    _HBM_CAPACITY_BLOCKS = 5000
+
+    def _compute_block_hashes(tokens):
+        if not tokens or len(tokens) < (_BLOCK_SIZE * _MIN_MATCH_BLOCKS):
+            return None
+        n_tok = min(len(tokens), 786432)
+        num_blocks = n_tok // _BLOCK_SIZE
+        arr = array.array("I", tokens[:num_blocks * _BLOCK_SIZE])
+        raw = arr.tobytes()
+        b_hashes = []
+        h = 0
+        block_bytes = _BLOCK_SIZE * 4
+        for i in range(num_blocks):
+            h = zlib.crc32(raw[i * block_bytes : (i + 1) * block_bytes], h)
+            b_hashes.append(h)
+        return b_hashes
+
+    def prefix_aware_get_core_engine(self, request):
+        nonlocal _block_map, _engine_hashes, _route_counts, _session_map, _engine_last_active
+        if getattr(request, "data_parallel_rank", None) is not None:
+            return orig_get(self, request)
+
+        num_engines = len(self.core_engines)
+        if num_engines <= 1:
+            return orig_get(self, request)
+
+        now = time.monotonic()
+        sid = getattr(request, "session_id", None)
+        tokens = getattr(request, "prompt_token_ids", None)
+        b_hashes = _compute_block_hashes(tokens)
+        req_blocks = len(b_hashes) if b_hashes else ((len(tokens) // _BLOCK_SIZE) if tokens else 0)
+
+        def _get_active(i):
+            eng = self.core_engines[i]
+            inflight = self.engine_inflight.get(eng, 0)
+            waiting, running, _ = self.lb_engines[i]
+            return max(self.client_count * inflight, waiting + running)
+
+        active_by_eng = [_get_active(i) for i in range(num_engines)]
+        min_active = min(active_by_eng)
+
+        match_idx = -1
+        matched_owners = None
+        if b_hashes:
+            for i in range(len(b_hashes) - 1, _MIN_MATCH_BLOCKS - 2, -1):
+                bh = b_hashes[i]
+                owners = _block_map.get(bh)
+                if owners:
+                    match_idx = i
+                    matched_owners = owners
+                    break
+
+        matched_blocks = (match_idx + 1) if match_idx >= 0 else 0
+        uncached_blocks = max(0, req_blocks - matched_blocks)
+        match_ratio = (matched_blocks / req_blocks) if req_blocks > 0 else 0.0
+        is_deep_match = (
+            matched_blocks >= _DEEP_MATCH_BLOCKS
+            and (match_ratio >= 0.35 or uncached_blocks <= 24)
+        )
+
+        if uncached_blocks <= 16 and match_ratio >= 0.5:
+            max_diff = 8
+        elif is_deep_match:
+            max_diff = 4
+        else:
+            max_diff = 0
+
+        candidate_idx = None
+
+        # Strategy 1: Active Session ID affinity with cost-aware queue cap
+        if sid and sid in _session_map:
+            s_idx = _session_map[sid] % num_engines
+            s_max_diff = 8 if uncached_blocks <= 24 else 4
+            if active_by_eng[s_idx] <= min_active + s_max_diff:
+                candidate_idx = s_idx
+
+        # Strategy 2: Ordered Primary-First Prefix Routing with Shallow-Header Gate
+        if candidate_idx is None and matched_owners:
+            for raw_idx in matched_owners:
+                idx = raw_idx % num_engines
+                if not is_deep_match:
+                    if active_by_eng[idx] == 0:
+                        candidate_idx = idx
+                        break
+                else:
+                    if active_by_eng[idx] <= min_active + max_diff:
+                        candidate_idx = idx
+                        break
+
+        # Strategy 3: Live-Load & Bounded-LRU Capacity-Aware Placement / Spillover
+        if candidate_idx is None:
+            def _engine_key(i):
+                active_reqs = active_by_eng[i]
+                waiting, running, kv_usage = self.lb_engines[i]
+                is_busy = 1 if active_reqs > 0 else 0
+                has_been_used = 1 if _route_counts.get(i, 0) > 0 else 0
+                lru_blocks = len(_engine_hashes.get(i, ()))
+                est_blocks = int(kv_usage * _HBM_CAPACITY_BLOCKS) if kv_usage > 0.05 else min(lru_blocks, _HBM_CAPACITY_BLOCKS)
+                overflow_blocks = max(0, est_blocks + req_blocks - _HBM_CAPACITY_BLOCKS) if est_blocks > 0 else 0
+                last_t = _engine_last_active.get(i, 0.0)
+                return (is_busy, has_been_used, active_reqs, overflow_blocks, round(kv_usage, 2), lru_blocks, last_t, i)
+
+            candidate_idx = min(range(num_engines), key=_engine_key)
+            _route_counts[candidate_idx] = _route_counts.get(candidate_idx, 0) + 1
+
+        if sid:
+            _session_map[sid] = candidate_idx
+
+        _engine_last_active[candidate_idx] = now
+        if b_hashes:
+            eng_od = _engine_hashes.get(candidate_idx)
+            if eng_od is None:
+                eng_od = OrderedDict()
+                _engine_hashes[candidate_idx] = eng_od
+            for i, bh in enumerate(b_hashes):
+                eng_od[bh] = None
+                eng_od.move_to_end(bh)
+                owners = _block_map.get(bh)
+                if owners is None:
+                    _block_map[bh] = [candidate_idx]
+                elif candidate_idx not in owners:
+                    # Do not let spilled/unrelated sessions hijack shallow common headers
+                    if (i >= 24 or is_deep_match) and len(owners) < _MAX_OWNERS:
+                        owners.append(candidate_idx)
+            while len(eng_od) > _HBM_CAPACITY_BLOCKS:
+                old_bh, _ = eng_od.popitem(last=False)
+                owners = _block_map.get(old_bh)
+                if owners:
+                    if candidate_idx in owners:
+                        owners.remove(candidate_idx)
+                    if not owners:
+                        _block_map.pop(old_bh, None)
+
+        chosen = self.core_engines[candidate_idx]
+        self.lb_engines[candidate_idx][0] += self.client_count
+        self.reqs_in_flight[request.request_id] = chosen
+        self.engine_inflight[chosen] += 1
+        return chosen
+
+    def _clear_router_state(client):
+        _block_map.clear()
+        _engine_hashes.clear()
+        _route_counts.clear()
+        _session_map.clear()
+        _engine_last_active.clear()
+        for lb in getattr(client, "lb_engines", ()):
+            lb[0] = 0
+            lb[1] = 0
+            lb[2] = 0.0
+        if hasattr(client, "reqs_in_flight"):
+            client.reqs_in_flight.clear()
+        if hasattr(client, "engine_inflight"):
+            client.engine_inflight.clear()
+        print("[prefix_routing] Cleared DP router state (_block_map, _session_map, _engine_hashes, lb_engines)", flush=True)
+
+    orig_reset_async = getattr(DPLBAsyncMPClient, "reset_prefix_cache_async", None)
+    if orig_reset_async is not None:
+        async def prefix_aware_reset_prefix_cache_async(self, *args, **kwargs):
+            _clear_router_state(self)
+            return await orig_reset_async(self, *args, **kwargs)
+        DPLBAsyncMPClient.reset_prefix_cache_async = prefix_aware_reset_prefix_cache_async
+
+    orig_reset = getattr(DPLBAsyncMPClient, "reset_prefix_cache", None)
+    if orig_reset is not None:
+        def prefix_aware_reset_prefix_cache(self, *args, **kwargs):
+            _clear_router_state(self)
+            return orig_reset(self, *args, **kwargs)
+        DPLBAsyncMPClient.reset_prefix_cache = prefix_aware_reset_prefix_cache
+
+    DPLBAsyncMPClient.get_core_engine_for_request = prefix_aware_get_core_engine
+    print("[prefix_routing] Enabled Trajectory & Prefix-Aware DP Router v4 (OrderedPrimaryFirst + ShallowHeaderGate + CostAwareSpillover + BoundedLRU-5000)", flush=True)
+
+_install_prefix_aware_routing()
