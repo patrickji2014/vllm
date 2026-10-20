@@ -138,12 +138,8 @@ def is_store_reachable_swa_chunk(
         return True
     assert sliding_window_chunks is not None
     position_in_segment = absolute_chunk_index % alignment_chunk_count
-    segment_start = absolute_chunk_index - position_in_segment
-    actual_segment_length = min(
-        alignment_chunk_count, storable_chunk_count - segment_start
-    )
     reachable_tail = sliding_window_chunks + int(is_eagle_group)
-    return position_in_segment >= actual_segment_length - reachable_tail
+    return position_in_segment >= alignment_chunk_count - reachable_tail
 
 
 def resolve_mamba_align_size(
@@ -226,7 +222,13 @@ class SchedulerOffloadConfig(NamedTuple):
         use_eagle = (
             vllm_config.speculative_config is not None
             and vllm_config.speculative_config.use_eagle()
+            and not (
+                vllm_config.speculative_config.use_dspark()
+                or vllm_config.speculative_config.use_dflash()
+            )
         )
+        if not use_eagle:
+            eagle_groups = set()
         if use_eagle and not eagle_groups:
             eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
 
@@ -405,7 +407,12 @@ class RequestOffloadState:
         num_allocated_chunks = (
             len(group_state.block_ids) // self.config.blocks_per_chunk
         )
-        return min(num_chunks, num_allocated_chunks)
+        res = min(num_chunks, num_allocated_chunks)
+        if group_config.alignment_chunk_count is not None:
+            res = (
+                res // group_config.alignment_chunk_count
+            ) * group_config.alignment_chunk_count
+        return res
 
     def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
         # max(): at the prefill->decode transition of a chunk-aligned prompt,
@@ -956,8 +963,14 @@ class OffloadingConnectorScheduler:
                   (between scheduler steps).
         """
         req_status = self._req_status[request.request_id]
-        for group_state in req_status.group_states:
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
             group_state.block_ids.clear()
+            if not req_status.transfer_jobs:
+                group_state.next_stored_chunk_idx = (
+                    num_computed_tokens // group_config.tokens_per_chunk
+                )
 
         if req_status.transfer_jobs:
             logger.debug(

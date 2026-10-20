@@ -1798,7 +1798,7 @@ def _get_packed_kv_cache_groups(
 
 def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    if spec_config is None or not spec_config.use_eagle() or spec_config.use_dspark() or spec_config.use_dflash():
         return False
     model_config = vllm_config.model_config
     return (
@@ -1841,7 +1841,7 @@ def _annotate_eagle_groups(
         use_deepseek_v4_fallback: Enable rule 2 for a DeepseekV4 packed group.
     """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    if spec_config is None or not spec_config.use_eagle() or spec_config.use_dspark() or spec_config.use_dflash():
         return
 
     for group in kv_cache_groups:
@@ -1876,7 +1876,7 @@ def _warn_if_unannotated_eagle_mamba(
         kv_cache_groups: Groups as they will be handed to consumers.
     """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    if spec_config is None or not spec_config.use_eagle() or spec_config.use_dspark() or spec_config.use_dflash():
         return
     if any(group.is_eagle_group for group in kv_cache_groups):
         return

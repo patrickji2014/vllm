@@ -109,7 +109,9 @@ class KVCacheCoordinator(ABC):
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }
         # Conservatively fall back to flag all groups when no group is flagged.
-        if use_eagle and not self.eagle_group_ids:
+        if not use_eagle:
+            self.eagle_group_ids = set()
+        elif not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
