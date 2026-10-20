@@ -611,27 +611,8 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < _lp_thresh < num_new_tokens:
-                if req_index + 1 < len(self.running):
-                    _other_rem = sum(
-                        max(
-                            0,
-                            r.num_tokens_with_spec
-                            + r.num_output_placeholders
-                            - r.num_computed_tokens,
-                        )
-                        for r in self.running[req_index + 1 :]
-                    )
-                    if _other_rem > 0:
-                        num_new_tokens = min(
-                            num_new_tokens,
-                            max(_lp_thresh, token_budget - min(_lp_thresh, _other_rem)),
-                        )
-                elif _warm_wait_reserve > 0 and num_new_tokens > _lp_thresh * 4:
-                    num_new_tokens = min(
-                        num_new_tokens,
-                        max(_lp_thresh, token_budget - _warm_wait_reserve),
-                    )
+            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -2296,62 +2277,7 @@ class Scheduler(SchedulerInterface):
                 request.block_hashes, max(request.num_tokens - 1, 0)
             )
             local_hit = int(res[1])
-            ext_hit = 0
-            if request.num_tokens - local_hit >= 1024 and self.connector is not None:
-                _step = getattr(self, "_paw_step_cnt", 0)
-                if (
-                    getattr(request, "_paw_ext_local", -1) == local_hit
-                    and _step - getattr(request, "_paw_ext_step", -999) < 32
-                ):
-                    ext_hit = getattr(request, "_paw_ext_hit", 0)
-                else:
-                    try:
-                        from itertools import islice
-                        from vllm.v1.kv_offload.base import make_offload_key
-
-                        conns = getattr(self.connector, "_connectors", None) or [self.connector]
-                        for c in conns:
-                            cs = getattr(c, "connector_scheduler", None)
-                            mgr = getattr(cs, "manager", None)
-                            if mgr is not None and hasattr(mgr, "_probe") and hasattr(mgr, "_expand_keys"):
-                                gcfg = cs.config.kv_group_configs[0]
-                                hpc = gcfg.hashes_per_chunk
-                                start_idx = local_hit // gcfg.tokens_per_chunk
-                                end_idx = max(request.num_tokens - 1, 0) // gcfg.tokens_per_chunk
-                                if end_idx > start_idx:
-                                    keys = [
-                                        make_offload_key(bh, gcfg.group_idx)
-                                        for bh in islice(
-                                            request.block_hashes,
-                                            start_idx * hpc + hpc - 1,
-                                            end_idx * hpc,
-                                            hpc,
-                                        )
-                                    ]
-                                    if keys and request.request_id not in getattr(mgr, "_failed_load_req_ids", ()):
-                                        probed = mgr._probe(
-                                            mgr._expand_keys(keys),
-                                            enable_global=getattr(mgr, "_enable_global", False),
-                                        )
-                                        dead = getattr(mgr, "_dead_sub_hashes", ())
-                                        if dead and probed:
-                                            valid_len = 0
-                                            for sh, _ in probed:
-                                                if sh in dead:
-                                                    break
-                                                valid_len += 1
-                                        else:
-                                            valid_len = len(probed) if probed else 0
-                                        f = getattr(mgr, "_device_block_size_factor", 1)
-                                        if valid_len > 0 and f > 0:
-                                            ext_hit = (valid_len // f) * gcfg.tokens_per_chunk
-                                break
-                    except Exception:
-                        pass
-                    request._paw_ext_local = local_hit
-                    request._paw_ext_step = _step
-                    request._paw_ext_hit = ext_hit
-            return max(0, request.num_tokens - (local_hit + ext_hit))
+            return max(0, request.num_tokens - local_hit)
         except Exception:
             return request.num_tokens
 

@@ -963,14 +963,8 @@ class OffloadingConnectorScheduler:
                   (between scheduler steps).
         """
         req_status = self._req_status[request.request_id]
-        for group_config, group_state in zip(
-            self.config.kv_group_configs, req_status.group_states
-        ):
+        for group_state in req_status.group_states:
             group_state.block_ids.clear()
-            if not req_status.transfer_jobs:
-                group_state.next_stored_chunk_idx = (
-                    num_computed_tokens // group_config.tokens_per_chunk
-                )
 
         if req_status.transfer_jobs:
             logger.debug(
