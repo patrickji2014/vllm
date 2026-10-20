@@ -580,3 +580,66 @@ class RayExecutorV2(MultiprocExecutor):
         for mq in getattr(self, "response_mqs", []):
             mq.shutdown()
         self.response_mqs = []
+
+
+def _select_tcpstore_port_fn(*args, **kwargs):
+    try:
+        from vllm.utils.network_utils import get_open_port
+        return get_open_port()
+    except Exception:
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            return sock.getsockname()[1]
+
+
+if "RayExecutorV2" in globals():
+    RayExecutorV2._select_tcpstore_port = staticmethod(_select_tcpstore_port_fn)
+
+if "RayWorkerProc" in globals():
+    def _patched_rwp_init(self, vllm_config=None, rank=0, input_shm_handle=None, is_driver_worker=False, is_driver_node=False, distributed_init_method=None, **kwargs):
+        self._vllm_config = vllm_config
+        self._parallel_config = getattr(vllm_config, "parallel_config", None) if vllm_config is not None else None
+        self._rank = rank
+        self._is_driver_node = is_driver_node
+        self._init_kwargs = dict(
+            vllm_config=vllm_config,
+            rank=rank,
+            distributed_init_method=distributed_init_method or kwargs.get("distributed_init_method"),
+            input_shm_handle=input_shm_handle or kwargs.get("input_shm_handle"),
+            shared_worker_lock=None,
+            is_driver_worker=is_driver_worker,
+        )
+
+    RayWorkerProc.__init__ = _patched_rwp_init
+
+    def _patched_rwp_iw(self, local_rank: int, env_vars: dict, *args, driver_env_vars: dict | None=None, assigned_physical_gpu_ids: list | None=None, **kwargs):
+        distributed_init_method = kwargs.get("distributed_init_method")
+        for arg in args:
+            if isinstance(arg, str):
+                distributed_init_method = arg
+            elif isinstance(arg, dict) and driver_env_vars is None:
+                driver_env_vars = arg
+            elif isinstance(arg, (list, tuple)) and assigned_physical_gpu_ids is None:
+                assigned_physical_gpu_ids = list(arg)
+        if distributed_init_method and not self._init_kwargs.get("distributed_init_method"):
+            self._init_kwargs["distributed_init_method"] = distributed_init_method
+
+        if driver_env_vars:
+            for key, value in driver_env_vars.items():
+                os.environ.setdefault(key, value)
+        for key, value in env_vars.items():
+            os.environ[key] = value
+
+        if assigned_physical_gpu_ids is not None:
+            cfg = self._init_kwargs.get("vllm_config")
+            if hasattr(cfg, "parallel_config"):
+                cfg.parallel_config.assigned_physical_gpu_ids = assigned_physical_gpu_ids
+
+        self.local_rank = local_rank
+        super(RayWorkerProc, self).__init__(
+            local_rank=local_rank,
+            **self._init_kwargs,
+        )
+
+    RayWorkerProc.initialize_worker = _patched_rwp_iw

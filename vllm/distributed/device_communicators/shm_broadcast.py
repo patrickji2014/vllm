@@ -805,7 +805,7 @@ class MessageQueue:
                     self._spin_condition.wait(timeout_ms=read_timeout.timeout_ms())
 
                     if self.shutting_down:
-                        raise RuntimeError("cancelled")
+                        return None
 
                     # if we wait for a long time, log a message
                     if read_timeout.should_warn():
