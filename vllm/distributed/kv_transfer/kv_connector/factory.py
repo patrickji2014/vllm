@@ -31,7 +31,7 @@ class KVConnectorFactory:
     def register_connector(cls, name: str, module_path: str, class_name: str) -> None:
         """Register a connector with a lazy-loading module and class name."""
         if name in cls._registry:
-            raise ValueError(f"Connector '{name}' is already registered.")
+            return
 
         def loader() -> type[KVConnectorBase]:
             module = importlib.import_module(module_path)
@@ -246,4 +246,25 @@ KVConnectorFactory.register_connector(
     "HF3FSKVConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector",
     "HF3FSKVConnector",
+)
+
+KVConnectorFactory.register_connector(
+    "TPUConnector",
+    "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+    "TPUConnector",
+)
+KVConnectorFactory.register_connector(
+    "TPURaidenConnector",
+    "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+    "TPURaidenConnector",
+)
+KVConnectorFactory.register_connector(
+    "TPURaidenOffloadingConnector",
+    "vllm_torchtpu.offload.raiden_connector",
+    "TPURaidenOffloadingConnector",
+)
+KVConnectorFactory.register_connector(
+    "TPUMultiConnector",
+    "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
+    "TPUMultiConnector",
 )
